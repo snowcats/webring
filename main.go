@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/subtle"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -104,7 +103,6 @@ func main() {
 	live := openLive("static/live.xml")
 	limit := newLimiter()
 	hook := &Discord{url: os.Getenv("WEBHOOK"), client: &http.Client{Timeout: 8 * time.Second}}
-	key := os.Getenv("KEY")
 	addr := env("ADDR", ":3400")
 
 	r := gin.New()
@@ -112,7 +110,7 @@ func main() {
 	r.Static("/static", "./static")
 	r.StaticFile("/embed.js", "./static/embed.js")
 	r.StaticFile("/stream.js", "./static/stream.js")
-	mount(r, store, live, limit, key, hook)
+	mount(r, store, live, limit, hook)
 
 	go func() {
 		for range time.Tick(5 * time.Minute) {
@@ -156,7 +154,7 @@ func loadDotEnv(path string) {
 func cors(c *gin.Context) {
 	c.Header("Access-Control-Allow-Origin", "*")
 	c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+	c.Header("Access-Control-Allow-Headers", "Content-Type")
 	if c.Request.Method == http.MethodOptions {
 		c.AbortWithStatus(http.StatusNoContent)
 		return
@@ -495,28 +493,6 @@ func safeIP(ip net.IP) bool {
 	return true
 }
 
-func auth(key string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if key == "" {
-			empty(c, http.StatusServiceUnavailable)
-			c.Abort()
-			return
-		}
-		got := strings.TrimSpace(c.GetHeader("Authorization"))
-		got = strings.TrimPrefix(got, "Bearer ")
-		got = strings.TrimPrefix(got, "bearer ")
-		if got == "" {
-			got = strings.TrimSpace(c.GetHeader("X-API-Key"))
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
-			empty(c, http.StatusUnauthorized)
-			c.Abort()
-			return
-		}
-		c.Next()
-	}
-}
-
 func (d *Discord) send(v any) {
 	if d == nil || d.url == "" {
 		return
@@ -671,155 +647,89 @@ func readURL(c *gin.Context) string {
 	return strings.TrimSpace(body.URL)
 }
 
-func mount(r *gin.Engine, store *Store, live *Live, limit *Limiter, key string, hook *Discord) {
-	dev := env("ALLOW_PRIVATE_URLS", "") == "1"
+func mount(r *gin.Engine, store *Store, live *Live, limit *Limiter, hook *Discord) {
 	api := r.Group("/api")
 
 	api.GET("/load", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"members": store.all(), "count": store.count()})
+		c.JSON(200, gin.H{"members": store.all(), "count": store.count()})
 	})
-	api.GET("/count", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"count": store.count()})
-	})
+
 	api.GET("/random", func(c *gin.Context) {
 		all := store.all()
 		if len(all) == 0 {
-			empty(c, http.StatusNotFound)
+			empty(c, 404)
 			return
 		}
-		c.JSON(http.StatusOK, all[rand.Intn(len(all))])
+		c.JSON(200, all[rand.Intn(len(all))])
 	})
-	api.GET("/u/:id", func(c *gin.Context) {
-		id, err := strconv.Atoi(c.Param("id"))
-		if err != nil {
-			empty(c, http.StatusBadRequest)
-			return
-		}
-		u, _, ok := store.byID(id)
-		if !ok {
-			empty(c, http.StatusNotFound)
-			return
-		}
-		c.JSON(http.StatusOK, u)
-	})
+
 	api.GET("/next/:id", func(c *gin.Context) {
 		id, err := strconv.Atoi(c.Param("id"))
 		if err != nil {
-			empty(c, http.StatusBadRequest)
+			empty(c, 400)
 			return
 		}
 		u, ok := store.neighbor(id, 1)
 		if !ok {
-			empty(c, http.StatusNotFound)
+			empty(c, 404)
 			return
 		}
-		c.JSON(http.StatusOK, u)
+		c.JSON(200, u)
 	})
+
 	api.GET("/back/:id", func(c *gin.Context) {
 		id, err := strconv.Atoi(c.Param("id"))
 		if err != nil {
-			empty(c, http.StatusBadRequest)
+			empty(c, 400)
 			return
 		}
 		u, ok := store.neighbor(id, -1)
 		if !ok {
-			empty(c, http.StatusNotFound)
+			empty(c, 404)
 			return
 		}
-		c.JSON(http.StatusOK, u)
-	})
-	api.GET("/info", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"name":    "snowcats",
-			"members": store.count(),
-			"connect": "https://api.snowcats.org/api/connect",
-			"cli":     "npx @snowcats/snw pub",
-		})
+		c.JSON(200, u)
 	})
 
-	connect := func(c *gin.Context) {
+	api.POST("/connect", func(c *gin.Context) {
 		site := readURL(c)
 		if site == "" {
-			empty(c, http.StatusBadRequest)
+			empty(c, 400)
 			return
 		}
 		ip := ipOf(c.Request)
 		if !limit.connect(ip, site) {
-			empty(c, http.StatusTooManyRequests)
+			empty(c, 429)
 			return
 		}
-		if !dev {
-			clean, ok := publicURL(site)
-			if !ok {
-				empty(c, http.StatusBadRequest)
-				return
-			}
-			site = clean
-		} else {
-			site = strings.TrimRight(site, "/")
+		clean, ok := publicURL(site)
+		if !ok {
+			empty(c, 400)
+			return
 		}
+		site = clean
 
 		if store.has(site) {
 			s := live.touch(site)
-			if u := store.find(site); u != nil {
-				c.JSON(http.StatusOK, gin.H{"ok": true, "status": "member", "url": s.URL, "user": u})
+			u := store.find(site)
+			if u == nil {
+				empty(c, 400)
 				return
 			}
-			empty(c, http.StatusBadRequest)
+			c.JSON(200, gin.H{"status": "member", "url": s.URL, "user": u})
 			return
 		}
-
 		if !limit.join(ip) {
-			empty(c, http.StatusTooManyRequests)
+			empty(c, 429)
 			return
 		}
-
 		u, ok := store.join(site)
 		if !ok {
-			empty(c, http.StatusBadRequest)
+			empty(c, 400)
 			return
 		}
 		s := live.touch(site)
 		hook.send(map[string]any{"event": "joined", "user": u, "users_xml": store.xml()})
-		c.JSON(http.StatusCreated, gin.H{"ok": true, "status": "joined", "url": s.URL, "user": u})
-	}
-	api.POST("/connect", connect)
-	api.POST("/stream", connect)
-
-	admin := api.Group("/", auth(key))
-	admin.GET("/live", func(c *gin.Context) {
-		list := live.list()
-		c.JSON(http.StatusOK, gin.H{"live": list, "count": len(list)})
-	})
-	admin.POST("/review/pull", func(c *gin.Context) {
-		live.pull(store)
-		c.Status(http.StatusNoContent)
-	})
-	admin.POST("/review", func(c *gin.Context) {
-		site := readURL(c)
-		if site == "" {
-			empty(c, http.StatusBadRequest)
-			return
-		}
-		res := review(site)
-		if !res.OK {
-			empty(c, http.StatusBadRequest)
-			return
-		}
-		c.JSON(http.StatusOK, res)
-	})
-	admin.POST("/submit", func(c *gin.Context) {
-		site := readURL(c)
-		if site == "" {
-			empty(c, http.StatusBadRequest)
-			return
-		}
-		u, ok := store.join(site)
-		if !ok {
-			empty(c, http.StatusBadRequest)
-			return
-		}
-		hook.send(map[string]any{"event": "joined", "user": u, "users_xml": store.xml()})
-		c.JSON(http.StatusCreated, gin.H{"ok": true, "user": u})
+		c.JSON(201, gin.H{"status": "joined", "url": s.URL, "user": u})
 	})
 }
